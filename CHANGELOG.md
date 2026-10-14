@@ -13,11 +13,14 @@ This project uses simple semantic versioning while the plugin is young:
 ### Fixed
 
 - A reply stays in its thread when that thread already exists. Fluxer anchors a thread to the message it was started from and gives the thread that message's id, so `400 THREAD_ALREADY_CREATED_FOR_MESSAGE` is now read as the thread to use rather than as a failed creation. Previously the whole turn was demoted to the parent channel — the reply that shows up outside its thread — whenever the anchor map did not know the thread: after a gateway restart, after an evicted anchor, or when two sends for one turn interleaved.
+- A thread a human renamed is no longer renamed again by the session title. When an adopted thread already carried a name, the follow-up rename was seeded with that name as its "only if unchanged" guard — which meant the guard passed by construction and the session title overwrote it. The guard is now the name this adapter would have given the thread, so an untouched thread is still renamed to the title while a human's name is left alone.
 - Thread creation is single-flight per anchor, so interleaved sends for one turn open one thread instead of racing, with the loser's POST returning the refusal above.
+- The per-anchor creation lock is never evicted while a send still holds it or waits on it. The lock map is bounded, and evicting purely on age could drop the lock a send was inside, so the next send for that anchor built a second lock and POSTed a second thread. Anchors with a send in flight now pin their lock, and the map keeps its bound once those sends finish.
 
 ### Verification
 
 - Regression tests cover adoption from the refusal, a restart that never created the thread, two interleaved sends opening a single thread, and the guard that keeps every other 4xx on the parent-channel fallback.
+- Regression tests cover the rename guard in both directions (a thread a human renamed is left alone; a thread still carrying its placeholder takes the session title) and the lock bound (neither a held nor a merely queued send can have its anchor's lock evicted, and the map returns to its bound afterwards). Reverting the adapter source makes exactly those four fail, so they pin behaviour rather than implementation.
 
 ## [0.5.1] - 2026-10-13
 
