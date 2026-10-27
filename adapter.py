@@ -593,6 +593,11 @@ _TITLE_RENAME_POLL_INTERVAL = 3.0
 _TITLE_RENAME_WINDOW_SECONDS = 180.0
 _TITLE_RENAME_MAX_PENDING = 64
 
+# Fluxer expires a typing indicator after a few seconds, so the loop refreshes on
+# this interval. Every refresh re-resolves the container: a turn can move into a
+# thread it opens mid-flight, and the indicator has to move with it.
+_TYPING_REFRESH_SECONDS = 8.0
+
 # Adapters that are currently connected, so the process-wide plugin hooks can find
 # the instance that owns a chat.
 _LIVE_ADAPTERS: "weakref.WeakSet[FluxerAdapter]" = weakref.WeakSet()
@@ -2347,14 +2352,22 @@ class FluxerAdapter(BasePlatformAdapter):
         # which case the thread is born with its final name and no rename follows.
         placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
         author_id = self._inbound_author_by_message.get(str(message_id)) or None
-        title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id), author_id)
+        # The anchor message id is the origin to look up, never the parent channel:
+        # Fluxer gives the thread that id, and a thread session is stored with
+        # ``chat_id`` = the thread id. A parent-channel lookup resolves whatever
+        # long-lived channel session happens to be live there -- on a busy channel a
+        # session from weeks ago -- and names a brand-new thread after it.
+        title = await asyncio.to_thread(self._session_title_for_chat, str(message_id), author_id)
         thread_name = _collapse_thread_name(title or "") or placeholder
         try:
             data = await self.create_thread(
                 str(chat_id), thread_name, message_id=str(message_id)
             )
         except Exception as exc:
-            logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
+            logger.info(
+                "Fluxer thread start failed for anchor %s in %s (%s); delivering to the channel",
+                message_id, chat_id, type(exc).__name__,
+            )
             return None
         thread_id = self._remember_thread_id(data, chat_id)
         if thread_id:
@@ -2367,7 +2380,10 @@ class FluxerAdapter(BasePlatformAdapter):
             if created_name != placeholder:
                 self._note_renamed_thread(thread_id, created_name)
             if not title:
-                self._schedule_title_rename(chat_id, thread_id, created_name, author_id)
+                # Watch the anchor's session, not the parent's: the thread belongs
+                # to the turn that triggered it, and only that session's title may
+                # name it.
+                self._schedule_title_rename(str(message_id), thread_id, created_name, author_id)
         return thread_id
 
     # ── session-title naming for a thread this adapter opened ───────────────────
@@ -2432,10 +2448,24 @@ class FluxerAdapter(BasePlatformAdapter):
             if not owner or owner == user_key:
                 return entry
         if candidates:
-            logger.debug(
-                "Fluxer /title rename skipped: %d auto-thread(s) in channel %s and none for user %s",
-                len(candidates), chat_key, user_id,
+            logger.info(
+                "Fluxer /title rename skipped for chat %s user %s: %d auto-thread(s), "
+                "none attributable to this session",
+                chat_key, user_id, len(candidates),
             )
+        return None
+
+    def _cached_auto_thread_name(self, thread_id: str) -> Optional[str]:
+        """The placeholder this adapter gave ``thread_id``, if it still remembers it."""
+        tid = str(thread_id or "")
+        if not tid:
+            return None
+        for _chat, (cached_id, name) in self._auto_thread_by_chat.items():
+            if str(cached_id) == tid:
+                return str(name or "")
+        for _session, (cached_id, name) in self._auto_thread_by_session.items():
+            if str(cached_id) == tid:
+                return str(name or "")
         return None
 
     def _session_title_for_chat(self, chat_id: str, user_id: Optional[str] = None) -> Optional[str]:
@@ -2451,6 +2481,13 @@ class FluxerAdapter(BasePlatformAdapter):
         deliberately: it is a slice of the triggering message, i.e. what the
         placeholder already says. Acquisition, reads and normalization are all
         best-effort: optional naming must never prevent message delivery.
+
+        A miss is logged at INFO naming the chat and participant. A thread is named
+        from the session keyed on its ANCHOR message id, so a not-yet-created
+        session row is the ordinary case for the first seconds of a turn -- the
+        caller keeps the placeholder and polls. Logging it is what distinguishes
+        that from a lookup that resolved the wrong container and produced a wrong
+        name with no trace.
         """
         try:
             store = self._get_session_store()
@@ -2462,13 +2499,25 @@ class FluxerAdapter(BasePlatformAdapter):
                 user_id=str(user_id) if user_id else None,
             )
             if not session_id:
+                logger.info(
+                    "Fluxer no session title for origin %s (user %s): no session row yet",
+                    chat_key, user_id,
+                )
                 return None
-            if store.get_session_title_source(session_id) not in _TITLE_RENAME_SOURCES:
+            source = store.get_session_title_source(session_id)
+            if source not in _TITLE_RENAME_SOURCES:
+                logger.info(
+                    "Fluxer no session title for origin %s (session %s): title source %r",
+                    chat_key, session_id, source,
+                )
                 return None
             title = store.get_session_title(session_id)
             return str(title).strip() or None
         except Exception as exc:
-            logger.debug("Fluxer session title lookup failed (%s)", type(exc).__name__)
+            # No identifiers and no exception text: this runs on the naming path of
+            # a possibly-private channel, and the store's own failure is already
+            # reported by whoever opened it.
+            logger.info("Fluxer session title lookup failed (%s)", type(exc).__name__)
             return None
 
     def _session_origin_for_key(self, session_key: str) -> Optional[tuple[str, str]]:
@@ -2577,7 +2626,9 @@ class FluxerAdapter(BasePlatformAdapter):
 
         Best-effort by design: a session that never gets a title, or a thread a
         human renamed in the meantime (declined by the placeholder guard), simply
-        keeps the name it has.
+        keeps the name it has. Every way out of this loop that leaves the thread
+        under its placeholder says so at INFO with the ids and the reason -- a
+        silently unnamed thread was previously indistinguishable from a named one.
         """
         deadline = time.monotonic() + _TITLE_RENAME_WINDOW_SECONDS
         while True:
@@ -2588,14 +2639,28 @@ class FluxerAdapter(BasePlatformAdapter):
                         thread_id, title, only_if_current_name=placeholder or None
                     )
                 except Exception as exc:
-                    logger.debug("Fluxer title rename failed for %s: %s", thread_id, exc)
+                    logger.info(
+                        "Fluxer thread %s not renamed (%s) from session title %r of %s",
+                        thread_id, type(exc).__name__, title, chat_id,
+                    )
                     return
                 if applied:
                     logger.info(
                         "Fluxer thread %s named from session title %r", thread_id, title
                     )
+                else:
+                    logger.info(
+                        "Fluxer thread %s not renamed to %r: it no longer carries the "
+                        "placeholder %r (renamed by hand?)",
+                        thread_id, title, placeholder,
+                    )
                 return
             if time.monotonic() >= deadline:
+                logger.info(
+                    "Fluxer thread %s keeps its placeholder %r: no session title for %s "
+                    "after %.0fs",
+                    thread_id, placeholder, chat_id, _TITLE_RENAME_WINDOW_SECONDS,
+                )
                 return
             await asyncio.sleep(_TITLE_RENAME_POLL_INTERVAL)
 
@@ -2619,20 +2684,76 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.debug("Fluxer /title rename could not be scheduled: %s", exc)
 
     async def _rename_thread_for_session(self, session_key: str, title: str) -> None:
-        origin = await asyncio.to_thread(self._session_origin_for_key, str(session_key))
-        if not origin:
+        """Rename the thread a ``/title`` belongs to.
+
+        Two id spaces meet here: the auto-thread maps are keyed on the PARENT
+        channel, while a thread-keyed session stores the THREAD id as its
+        ``chat_id``. Joining them on the session row's chat_id is why ``/title``
+        never reached a thread. A thread-keyed session names its thread in the key
+        itself, so it is read from there and the map join is skipped entirely --
+        which also makes the rename work in a process that never created the thread
+        (the maps are process-lifetime only). A channel-keyed session keeps the
+        per-user map join, including its refusal to rename someone else's thread.
+        """
+        thread_id, guard = await asyncio.to_thread(
+            self._resolve_title_rename_target, str(session_key)
+        )
+        if not thread_id:
             return
-        entry = self._auto_thread_for_session(origin[0], origin[1])
-        if not entry:
-            return
-        thread_id, initial_name = entry
         try:
-            applied = await self.rename_thread(thread_id, title, only_if_current_name=initial_name or None)
+            applied = await self.rename_thread(
+                thread_id, title, only_if_current_name=guard or None
+            )
         except Exception as exc:
-            logger.debug("Fluxer /title rename failed for %s: %s", thread_id, exc)
+            logger.info(
+                "Fluxer /title rename failed for thread %s (%s)", thread_id, type(exc).__name__
+            )
             return
         if applied:
             logger.info("Fluxer thread %s named from /title", thread_id)
+
+    def _resolve_title_rename_target(self, session_key: str) -> tuple[str, str]:
+        """``(thread_id, placeholder_guard)`` for a ``/title`` rename, or ``("", "")``.
+
+        A thread-keyed session names its container in the key, so the thread is
+        taken from there and the guard is whatever placeholder this process still
+        remembers (``""`` after a restart, which leaves the rename unguarded: an
+        explicit ``/title`` must land). A channel-keyed session is resolved through
+        the auto-thread maps, which is where the participant-scoped lookup and its
+        deliberate refusal to rename another person's thread live.
+        """
+        key = str(session_key or "").strip()
+        thread_id = _thread_id_from_session_key(key, str(self.platform.value))
+        if thread_id:
+            return thread_id, (self._cached_auto_thread_name(thread_id) or "")
+        origin = self._session_origin_for_key(key)
+        if not origin:
+            logger.info(
+                "Fluxer /title rename skipped for session %s: no session origin", key
+            )
+            return "", ""
+        entry = self._auto_thread_for_session(origin[0], origin[1])
+        if not entry:
+            logger.info(
+                "Fluxer /title rename skipped for channel %s user %s: no thread attributable "
+                "to this session",
+                origin[0], origin[1],
+            )
+            return "", ""
+        return str(entry[0]), str(entry[1] or "")
+
+    def _cached_auto_thread_name(self, thread_id: str) -> Optional[str]:
+        """The placeholder this adapter gave ``thread_id``, if it still remembers it."""
+        tid = str(thread_id or "")
+        if not tid:
+            return None
+        for _chat, (cached_id, name) in self._auto_thread_by_chat.items():
+            if str(cached_id) == tid:
+                return str(name or "")
+        for _session, (cached_id, name) in self._auto_thread_by_session.items():
+            if str(cached_id) == tid:
+                return str(name or "")
+        return None
 
     async def _fetch_channel_name(self, channel_id: str) -> Optional[str]:
         """Current server-side name of a channel or thread, else ``None``."""
@@ -3169,8 +3290,18 @@ class FluxerAdapter(BasePlatformAdapter):
         # it through the same resolver as delivery -- opening the prospective thread
         # if it does not exist yet, rather than refreshing the parent channel.
         target = await self._typing_target(chat_id, metadata)
+        # Say which container the indicator was armed on, at INFO. "No indicator
+        # appeared" was previously untraceable: nothing recorded whether the loop
+        # picked the thread, the parent, or gave up. Logged once per turn, not per
+        # tick, so a long turn does not flood the gateway log.
+        logger.info(
+            "Fluxer typing indicator armed for container %s (turn %s/%s)%s",
+            target or chat_id, chat_key[0], chat_key[1],
+            "" if str(target) != str(chat_id) else ", the turn's own chat",
+        )
 
         async def _typing_loop() -> None:
+            nonlocal target
             try:
                 while True:
                     try:
@@ -3178,9 +3309,27 @@ class FluxerAdapter(BasePlatformAdapter):
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        logger.debug("Fluxer typing indicator failed for %s: %s", chat_key, exc)
+                        logger.info(
+                            "Fluxer typing indicator for %s stopped after an error (%s)",
+                            target, type(exc).__name__,
+                        )
                         return
-                    await asyncio.sleep(8)
+                    await asyncio.sleep(_TYPING_REFRESH_SECONDS)
+                    # Re-resolve on EVERY tick. The turn's container is not fixed
+                    # when the loop starts: the thread may be created (or adopted)
+                    # by the first delivery a few seconds later, and a target read
+                    # once here would keep refreshing the parent channel for the
+                    # rest of the turn -- the indicator in one place, the reply in
+                    # another. The resolver already knows about pending threads,
+                    # explicitly chosen containers and dead-container redirects, so
+                    # the follow-up ticks land where the turn actually delivers.
+                    next_target = await self._typing_target(chat_id, metadata)
+                    if next_target and next_target != target:
+                        logger.info(
+                            "Fluxer typing indicator for this turn moved from %s to %s",
+                            target, next_target,
+                        )
+                        target = next_target
             except asyncio.CancelledError:
                 pass
             finally:
