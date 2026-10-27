@@ -2921,12 +2921,27 @@ class FluxerAdapter(BasePlatformAdapter):
                     # would fail the fallback for the same reason.
                     if reply_to and self._reply_to_mode != "off" and not reference_rejected:
                         payload["message_reference"] = {"message_id": str(reply_to)}
-                    data = await self._multipart_request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        payload=payload,
-                        files=[("files[0]", path, filename)],
-                    )
+                    try:
+                        data = await self._multipart_request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            payload=payload,
+                            files=[("files[0]", path, filename)],
+                        )
+                    except Exception as fallback_exc:
+                        if not (
+                            _is_unknown_message_error(fallback_exc)
+                            and "message_reference" in payload
+                        ):
+                            raise
+                        reference_rejected = True
+                        payload = {k: v for k, v in payload.items() if k != "message_reference"}
+                        data = await self._multipart_request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            payload=payload,
+                            files=[("files[0]", path, filename)],
+                        )
                     break
             message_id = str(data.get("id")) if data.get("id") else None
             # Edits/deletes must target the thread, not the caller's channel.

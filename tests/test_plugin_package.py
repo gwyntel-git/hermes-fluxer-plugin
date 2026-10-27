@@ -3146,6 +3146,33 @@ async def test_an_unknown_reference_retry_is_bounded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unknown_reference_in_first_split_chunk_is_removed_from_later_chunks(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(reply_to_mode="all")
+    adapter._verify_delivery = AsyncMock(return_value=None)
+    state = {"calls": 0}
+
+    async def _request(_method, _path, **_kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise _RestStatusError(404, UNKNOWN_MESSAGE_BODY)
+        return {"id": f"chunk-{state['calls']}"}
+
+    adapter._request = AsyncMock(side_effect=_request)
+
+    result = await adapter.send(
+        "chan-1", "line\n" * 2000, reply_to="stale-msg", metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    posts = [call for call in calls if call.args == ("POST", "/channels/thread-7/messages")]
+    assert len(posts) > 3
+    assert posts[0].kwargs["json"]["message_reference"] == {"message_id": "stale-msg"}
+    assert all("message_reference" not in post.kwargs["json"] for post in posts[1:])
+
+
+@pytest.mark.asyncio
 async def test_a_network_failure_after_an_unknown_reference_is_not_retried(monkeypatch):
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
     adapter = _send_adapter()
@@ -3280,6 +3307,35 @@ async def test_an_unknown_reference_during_an_upload_retries_in_the_same_thread(
     assert uploads[1].args[1] == "/channels/thread-7/messages"
     assert "message_reference" not in uploads[1].kwargs["payload"]
     assert result.message_id == "file-1"
+
+
+@pytest.mark.asyncio
+async def test_upload_unknown_reference_on_parent_fallback_retries_without_it(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._request = AsyncMock(return_value={"id": "thread-1"})
+    adapter._multipart_request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404),
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            {"id": "file-1"},
+        ]
+    )
+
+    result = await adapter._send_file_message("chan-1", str(document), reply_to="user-msg-1")
+
+    assert result.success is True
+    calls = adapter._multipart_request.await_args_list
+    assert [call.args[1] for call in calls] == [
+        "/channels/thread-1/messages",
+        "/channels/chan-1/messages",
+        "/channels/chan-1/messages",
+    ]
+    assert calls[1].kwargs["payload"]["message_reference"] == {"message_id": "user-msg-1"}
+    assert "message_reference" not in calls[2].kwargs["payload"]
 
 
 @pytest.mark.asyncio
