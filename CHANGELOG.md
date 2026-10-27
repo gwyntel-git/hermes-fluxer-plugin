@@ -16,7 +16,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Verification
 
-- Regression tests cover an unknown reference retried in the same thread and in a channel, the single bounded retry, an unrelated network failure not being retried, a genuine `UNKNOWN_CHANNEL` still falling back, the dead-thread fallback not restoring a rejected reference, and uploads taking the same retry path. All seven fail against the pre-fix adapter.
+- Regression tests cover an unknown reference retried in the same thread and in a channel, the single bounded retry, an unrelated network failure not being retried, a genuine `UNKNOWN_CHANNEL` still falling back, the dead-thread fallback not restoring a rejected reference, uploads taking the same retry path (in-thread and after a parent-channel fallback), and a rejected reference being dropped from the remaining chunks of a split reply. Nine fail against the pre-fix adapter.
 
 ## [0.5.1] - 2026-10-13
 
