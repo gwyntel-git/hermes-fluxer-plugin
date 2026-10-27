@@ -1349,6 +1349,13 @@ class FluxerAdapter(BasePlatformAdapter):
         # indicator and the approval prompt all have to be routed to it --
         # creating it on first use.
         self._threads_pending: Dict[str, str] = {}
+        # Auto-threads with a turn executing right now, keyed
+        # ``(parent_chat_id, user_id)`` -> ``{thread_id: live turn count}``. This is
+        # a narrow adapter-local index for one case: a command typed in the PARENT
+        # channel that has to address the turn running in this user's thread. It
+        # never changes the persisted session key, and the count keeps one ending
+        # turn from erasing another's entry.
+        self._active_auto_threads: Dict[tuple[str, str], Dict[str, int]] = {}
         # The kind of a channel id learned from the API (``thread`` / ``channel``).
         # Fluxer's own MESSAGE_CREATE payload carries no ``channel_type`` and no
         # nested channel object, so the raw event cannot classify itself; without
@@ -2288,15 +2295,101 @@ class FluxerAdapter(BasePlatformAdapter):
         # actual event, keeping ownership until final/footer/media delivery ends.
         marker = self._turn_context.set((event, session_key))
         key = self._turn_key(event.source.chat_id)
+        active_thread = self._register_active_auto_thread(event.source)
         try:
             await super()._process_message_background(event, session_key)
         finally:
             try:
                 await self.stop_typing(event.source.chat_id)
             finally:
+                if active_thread:
+                    self._unregister_active_auto_thread(*active_thread)
                 self._turn_anchor.pop(key, None)
                 self._turn_thread_disabled.discard(key)
                 self._turn_context.reset(marker)
+
+    def _register_active_auto_thread(self, source: Any) -> Optional[tuple[str, str, str]]:
+        """Track a turn executing in this adapter's own thread, for parent commands.
+
+        Only a thread this adapter opened qualifies: a thread a human created has
+        no parent-channel session to be reached from, and retargeting a parent
+        command into it would cancel a turn the operator never started.
+        """
+        parent = str(getattr(source, "parent_chat_id", None) or "").strip()
+        user_id = str(getattr(source, "user_id", None) or "").strip()
+        thread_id = str(getattr(source, "chat_id", None) or "").strip()
+        if not (parent and user_id and thread_id):
+            return None
+        if str(getattr(source, "chat_type", None) or "") != "thread":
+            return None
+        if self._thread_is_bot_owned(thread_id) is not True:
+            return None
+        threads = self._active_auto_threads.setdefault((parent, user_id), {})
+        threads[thread_id] = threads.get(thread_id, 0) + 1
+        return parent, user_id, thread_id
+
+    def _unregister_active_auto_thread(self, parent: str, user_id: str, thread_id: str) -> None:
+        """Release one live turn on a thread; the entry goes when the last ends."""
+        key = (str(parent), str(user_id))
+        threads = self._active_auto_threads.get(key)
+        if not threads:
+            return
+        remaining = threads.get(str(thread_id), 0) - 1
+        if remaining > 0:
+            threads[str(thread_id)] = remaining
+        else:
+            threads.pop(str(thread_id), None)
+        if not threads:
+            self._active_auto_threads.pop(key, None)
+
+    def _active_auto_thread_for_user(self, parent: str, user_id: str) -> Optional[str]:
+        """That user's one live auto-thread under ``parent``, or ``None``.
+
+        ``None`` for zero threads AND for two: a command cannot be retargeted at an
+        arbitrary member of a set, and cancelling the wrong run is worse than
+        leaving the command on the parent channel.
+        """
+        threads = self._active_auto_threads.get((str(parent), str(user_id))) or {}
+        return next(iter(threads)) if len(threads) == 1 else None
+
+    def _command_targets_active_thread(self, data: Dict[str, Any], channel_id: str) -> Optional[str]:
+        """The active auto-thread a parent-channel ``/stop`` should address, if any.
+
+        A turn this adapter moved into a thread is keyed on the THREAD, so a
+        ``/stop`` typed in the parent channel derives the channel's session key and
+        cancels a session with no run while the real turn keeps going. Fluxer gives
+        the thread the id of the message that opened it, and that message came from
+        the parent channel, so the operator's own next command there is the natural
+        way to stop it -- it just has to address the thread's session.
+        """
+        content = str(data.get("content") or "").lstrip()
+        if not content.startswith("/"):
+            return None
+        name = content.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
+        if name != "stop":
+            # Only /stop addresses a running turn; /new, /title and the rest act on
+            # the session they are typed into and keep their channel semantics.
+            return None
+        author = data.get("author") or data.get("user") or {}
+        user_id = str(
+            author.get("id") if isinstance(author, Mapping) else ""
+        ).strip() or str(data.get("author_id") or "").strip()
+        if not user_id:
+            return None
+        target = self._active_auto_thread_for_user(str(channel_id), user_id)
+        if target:
+            logger.info(
+                "Fluxer parent-channel /stop from %s in %s routed to the active thread %s",
+                user_id, channel_id, target,
+            )
+        elif self._active_auto_threads.get((str(channel_id), user_id)):
+            logger.info(
+                "Fluxer parent-channel /stop from %s in %s left on the channel: "
+                "%d active threads, none unambiguous",
+                user_id, channel_id,
+                len(self._active_auto_threads[(str(channel_id), user_id)]),
+            )
+        return target
 
     def _pin_turn_anchor(self, chat_id: str, metadata=None) -> None:
         """Remember only the executing event or an explicit trigger."""
@@ -2983,6 +3076,12 @@ class FluxerAdapter(BasePlatformAdapter):
         # reply -- which both resolve their container from the turn anchor -- do not
         # open a thread on the command's own message either.
         if _is_text_command(str(data.get("content") or "")):
+            # A parent-channel /stop addresses the turn this user has running in a
+            # thread -- that turn's session is keyed on the thread, so the channel's
+            # own key would cancel nothing. Other commands keep the channel session.
+            active_thread = self._command_targets_active_thread(data, channel_id)
+            if active_thread:
+                return active_thread, "thread", str(channel_id), None
             anchor = str(data.get("id") or "").strip()
             if anchor:
                 self._remember_no_thread_anchor(channel_id, anchor)

@@ -31,6 +31,7 @@ import logging
 import sqlite3
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -437,3 +438,121 @@ async def test_a_title_rename_on_a_thread_key_logs_the_thread_it_reached(state_d
     await adapter._rename_thread_for_session(THREAD_KEY, "Renamed by hand")
 
     assert f"Fluxer thread {ANCHOR} named from /title" in caplog.text
+
+
+# ── the same id space for a parent-channel /stop ───────────────────────────────
+
+
+def _stop_message(user_id=USER, content="/stop"):
+    return {
+        "id": "cmd-1",
+        "channel_id": PARENT,
+        "content": content,
+        "author": {"id": user_id},
+        "guild_id": "guild-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_parent_stop_addresses_the_thread_this_users_turn_runs_in():
+    """``/stop`` in the channel must cancel the turn that moved into a thread.
+
+    The turn's session is keyed on the THREAD, so the channel's own key cancels a
+    session with no run while the real turn keeps going.
+    """
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {ANCHOR: 1}
+
+    chat_id, chat_type, parent, pending = await adapter._resolve_thread_source(
+        _stop_message(), PARENT, "channel"
+    )
+
+    assert (chat_id, chat_type, parent) == (ANCHOR, "thread", PARENT)
+    assert pending is None
+
+
+@pytest.mark.asyncio
+async def test_a_parent_stop_does_not_guess_between_two_active_threads():
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": "thread-a"}, PARENT)
+    adapter._remember_thread_id({"id": "thread-b"}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {"thread-a": 1, "thread-b": 1}
+
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        _stop_message(), PARENT, "channel"
+    )
+
+    assert (chat_id, chat_type) == (PARENT, "channel")
+
+
+@pytest.mark.asyncio
+async def test_another_users_active_thread_does_not_retarget_a_parent_stop():
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._active_auto_threads[(PARENT, OTHER)] = {ANCHOR: 1}
+
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        _stop_message(user_id=USER), PARENT, "channel"
+    )
+
+    assert (chat_id, chat_type) == (PARENT, "channel")
+
+
+@pytest.mark.asyncio
+async def test_a_thread_a_human_created_never_enters_the_active_index():
+    """Only this adapter's own threads are retargetable, even at registration."""
+    adapter = _adapter()
+    adapter._remember_thread_owner(ANCHOR, False)
+    source = SimpleNamespace(
+        chat_id=ANCHOR, parent_chat_id=PARENT, chat_type="thread", user_id=USER,
+    )
+
+    assert adapter._register_active_auto_thread(source) is None
+    assert adapter._active_auto_threads == {}
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        _stop_message(), PARENT, "channel"
+    )
+    assert (chat_id, chat_type) == (PARENT, "channel")
+
+
+@pytest.mark.asyncio
+async def test_other_parent_commands_keep_the_channel_session():
+    """Only /stop addresses a running turn; /new must not land in someone's thread."""
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {ANCHOR: 1}
+
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        _stop_message(content="/new"), PARENT, "channel"
+    )
+
+    assert (chat_id, chat_type) == (PARENT, "channel")
+
+
+@pytest.mark.asyncio
+async def test_the_active_thread_index_is_released_when_the_turn_ends():
+    """A finished turn must not keep retargeting later /stop commands.
+
+    ``_register_active_auto_thread`` / ``_unregister_active_auto_thread`` are the
+    pair under test: registration happens as the turn starts and the entry has to
+    be gone once it ends, or a later ``/stop`` in the channel cancels nothing.
+    """
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    source = SimpleNamespace(
+        chat_id=ANCHOR, parent_chat_id=PARENT, chat_type="thread", user_id=USER,
+    )
+
+    registered = adapter._register_active_auto_thread(source)
+    assert registered == (PARENT, USER, ANCHOR)
+    assert adapter._active_auto_threads == {(PARENT, USER): {ANCHOR: 1}}
+
+    # A second concurrent turn on the same thread must not be erased by the first
+    # one finishing.
+    adapter._register_active_auto_thread(source)
+    adapter._unregister_active_auto_thread(*registered)
+    assert adapter._active_auto_threads == {(PARENT, USER): {ANCHOR: 1}}
+
+    adapter._unregister_active_auto_thread(*registered)
+    assert (PARENT, USER) not in adapter._active_auto_threads
