@@ -614,9 +614,9 @@ def test_pending_auto_thread_is_registered_and_released():
     adapter = _adapter()
     adapter._threads_pending[ANCHOR] = PARENT
     source = SimpleNamespace(chat_id=ANCHOR, parent_chat_id=PARENT, chat_type="thread", user_id=USER)
-    token = adapter._register_active_auto_thread(source)
-    assert token == (PARENT, USER, ANCHOR)
-    adapter._unregister_active_auto_thread(*token)
+    registered = adapter._register_active_auto_thread(source)
+    assert registered == (PARENT, USER, ANCHOR)
+    adapter._unregister_active_auto_thread(*registered)
     assert adapter._active_auto_threads == {}
 
 
