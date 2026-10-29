@@ -863,3 +863,98 @@ async def test_a_goal_control_command_is_not_retargeted_when_the_thread_is_ambig
     )
 
     assert (chat_id, chat_type) == (PARENT, "channel")
+
+
+@pytest.mark.asyncio
+async def test_a_paused_goals_resume_reaches_its_thread_with_no_live_turn():
+    """A goal outlives its turns, so parent controls cannot ride the turn index.
+
+    Pausing a goal ENDS its turn: the live-turn entry is released, and the next
+    command arrives with nothing to point at the goal's thread. Without a link that
+    survives the goal's lifetime, ``/goal resume`` in the parent channel addresses the
+    empty channel session and the goal can never be resumed.
+    """
+    adapter = _adapter()
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        {"id": ANCHOR, "channel_id": PARENT, "content": "/goal confirm the mac watcher",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+    assert (chat_id, chat_type) == (ANCHOR, "thread")
+    # The kickoff turn ended (and nothing is running: the goal is paused).
+    adapter._active_auto_threads.clear()
+
+    chat_id, chat_type, parent, pending = await adapter._resolve_thread_source(
+        {"id": "cmd-resume", "channel_id": PARENT, "content": "/goal resume",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type, parent, pending) == (ANCHOR, "thread", PARENT, None)
+
+
+@pytest.mark.asyncio
+async def test_a_finished_goals_controls_go_back_to_the_channel():
+    """`/goal clear` ends the goal, so its container link must not linger."""
+    adapter = _adapter()
+    await adapter._resolve_thread_source(
+        {"id": ANCHOR, "channel_id": PARENT, "content": "/goal confirm the mac watcher",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+    adapter._active_auto_threads.clear()
+    await adapter._resolve_thread_source(
+        {"id": "cmd-clear", "channel_id": PARENT, "content": "/goal clear",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        {"id": "cmd-status", "channel_id": PARENT, "content": "/goal status",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type) == (PARENT, "channel")
+    assert adapter._goal_threads == {}
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_goal_thread_stops_carrying_goal_controls():
+    """A dead container is never addressed again; the command falls back to the channel."""
+    adapter = _adapter()
+    await adapter._resolve_thread_source(
+        {"id": ANCHOR, "channel_id": PARENT, "content": "/goal confirm the mac watcher",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+    adapter._active_auto_threads.clear()
+    adapter._remember_dead_container(ANCHOR, PARENT)
+
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        {"id": "cmd-pause", "channel_id": PARENT, "content": "/goal pause",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type) == (PARENT, "channel")
+    assert adapter._goal_threads == {}
+
+
+@pytest.mark.asyncio
+async def test_a_goal_link_is_not_shared_between_users():
+    """One user's goal thread must never capture another user's goal commands."""
+    adapter = _adapter()
+    await adapter._resolve_thread_source(
+        {"id": ANCHOR, "channel_id": PARENT, "content": "/goal confirm the mac watcher",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        {"id": "cmd-other", "channel_id": PARENT, "content": "/goal status",
+         "author": {"id": OTHER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type) == (PARENT, "channel")

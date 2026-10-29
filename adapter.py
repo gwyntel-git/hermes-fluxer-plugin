@@ -718,6 +718,8 @@ _GOAL_CONTROL_WORDS = frozenset({
 # then one continuation turn after another, so its container has to be chosen once,
 # at the command, and then reused by every turn of the series.
 _SESSION_STARTING_COMMANDS = frozenset({"goal"})
+# Goal-control verbs that END the goal, so the container link goes with it.
+_GOAL_ENDING_WORDS = frozenset({"clear", "stop", "done"})
 
 
 def _command_name_and_args(text: str) -> tuple[str, str]:
@@ -761,6 +763,24 @@ def _addresses_active_goal(text: str) -> bool:
     if name == "subgoal":
         return True
     return name in _SESSION_STARTING_COMMANDS and not _starts_own_session(text)
+
+
+def _author_id_from_data(data: Dict[str, Any]) -> str:
+    """The sender's id from a raw Fluxer message payload, or ``""`` when absent."""
+    payload = data or {}
+    author = payload.get("author") or payload.get("user") or {}
+    return str(
+        author.get("id") if isinstance(author, Mapping) else ""
+    ).strip() or str(payload.get("author_id") or "").strip()
+
+
+def _goal_control_ends_goal(text: str) -> bool:
+    """True for the goal-control forms that END the goal rather than re-aim it."""
+    name, args = _command_name_and_args(text)
+    if name not in _SESSION_STARTING_COMMANDS or _starts_own_session(text):
+        return False
+    first = args.split(None, 1)[0].lower() if args else ""
+    return first in _GOAL_ENDING_WORDS
 
 
 def _thread_id_from_session_key(session_key: Optional[str], platform: str) -> Optional[str]:
@@ -1414,6 +1434,14 @@ class FluxerAdapter(BasePlatformAdapter):
         # never changes the persisted session key, and the count keeps one ending
         # turn from erasing another's entry.
         self._active_auto_threads: Dict[tuple[str, str], Dict[str, int]] = {}
+        # The container a GOAL lives in, keyed ``(parent_chat_id, user_id)``. A goal
+        # outlives any single turn -- it is paused between turns and resumed later --
+        # so ``_active_auto_threads`` cannot carry this link: that entry is released
+        # the moment its turn ends, and a paused goal's ``/goal resume`` typed in the
+        # parent channel would then address the empty channel session instead of the
+        # goal's thread. Written when a kickoff command claims its anchor, read by the
+        # goal-control commands, dropped when the goal ends or its thread dies.
+        self._goal_threads: OrderedDict[tuple[str, str], str] = OrderedDict()
         # The kind of a channel id learned from the API (``thread`` / ``channel``).
         # Fluxer's own MESSAGE_CREATE payload carries no ``channel_type`` and no
         # nested channel object, so the raw event cannot classify itself; without
@@ -2311,6 +2339,8 @@ class FluxerAdapter(BasePlatformAdapter):
             self._auto_thread_by_chat.pop(chat_key, None)
         for session_key in [k for k, v in self._auto_thread_by_session.items() if v[0] == tid]:
             self._auto_thread_by_session.pop(session_key, None)
+        for goal_key in [k for k, v in self._goal_threads.items() if v == tid]:
+            self._goal_threads.pop(goal_key, None)
 
     def _pinned_turn_anchor(self, chat_id: str) -> str:
         """Anchor message pinned when the current turn started, else ``""``."""
@@ -2412,6 +2442,39 @@ class FluxerAdapter(BasePlatformAdapter):
         threads = self._active_auto_threads.get((str(parent), str(user_id))) or {}
         return next(iter(threads)) if len(threads) == 1 else None
 
+    def _remember_goal_thread(self, channel_id: str, user_id: str, thread_id: str) -> None:
+        """Link a goal to the container its kickoff claimed, for the goal's lifetime.
+
+        A goal spans turns: it is paused between them and resumed later, so the
+        live-turn index cannot carry this. That entry is released the moment its turn
+        ends, which would leave a paused goal's ``/goal resume`` typed in the parent
+        channel addressing the empty channel session.
+        """
+        key = (str(channel_id or ""), str(user_id or ""))
+        tid = str(thread_id or "").strip()
+        if not key[0] or not key[1] or not tid:
+            return
+        self._goal_threads[key] = tid
+        self._goal_threads.move_to_end(key)
+        while len(self._goal_threads) > self._threads_by_anchor_max:
+            self._goal_threads.popitem(last=False)
+
+    def _goal_thread_for(self, channel_id: str, user_id: str) -> Optional[str]:
+        """The container this user's goal lives in, unless it is known to be gone."""
+        key = (str(channel_id or ""), str(user_id or ""))
+        tid = self._goal_threads.get(key)
+        if not tid:
+            return None
+        if self._dead_containers.get(tid):
+            # A deleted thread's id never comes back: forget the link and let the
+            # command address the channel instead of a container that is not there.
+            self._goal_threads.pop(key, None)
+            return None
+        return tid
+
+    def _forget_goal_thread(self, channel_id: str, user_id: str) -> None:
+        self._goal_threads.pop((str(channel_id or ""), str(user_id or "")), None)
+
     def _command_targets_active_thread(self, data: Dict[str, Any], channel_id: str) -> Optional[str]:
         """The active auto-thread a parent-channel command should address, if any.
 
@@ -2424,29 +2487,34 @@ class FluxerAdapter(BasePlatformAdapter):
 
         ``/stop`` is the plain case. The goal-control commands (``/goal status``,
         ``/goal pause``, ``/subgoal add ...``) have the same reach problem once a
-        ``/goal`` kickoff owns a thread, and a command that starts a NEW goal is
-        deliberately excluded: retargeting it would replace the goal already running
-        instead of starting a second one.
+        ``/goal`` kickoff owns a thread. They fall back to the goal's own container
+        link, because a goal outlives a turn: pausing it ends its turn, and
+        ``/goal resume`` has to find the thread with no live turn to point at it. A
+        command that starts a NEW goal is deliberately excluded: retargeting it would
+        replace the goal already running instead of starting a second one.
         """
         content = str(data.get("content") or "").lstrip()
         if not content.startswith("/"):
             return None
         name = content.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
-        if name != "stop" and not _addresses_active_goal(content):
+        goal_control = _addresses_active_goal(content)
+        if name != "stop" and not goal_control:
             # Only a command that acts on the running turn (or on the goal that turn
             # is serving) is retargeted; /new, /title and the rest act on the
             # session they are typed into and keep their channel semantics.
             return None
-        author = data.get("author") or data.get("user") or {}
-        user_id = str(
-            author.get("id") if isinstance(author, Mapping) else ""
-        ).strip() or str(data.get("author_id") or "").strip()
+        user_id = _author_id_from_data(data)
         if not user_id:
             return None
+        if _goal_control_ends_goal(content):
+            # The goal is over, so the link to its container goes with it.
+            self._forget_goal_thread(channel_id, user_id)
         target = self._active_auto_thread_for_user(str(channel_id), user_id)
+        if not target and goal_control:
+            target = self._goal_thread_for(channel_id, user_id)
         if target:
             logger.info(
-                "Fluxer parent-channel /%s routed to the active thread", name
+                "Fluxer parent-channel /%s routed to the thread it belongs to", name
             )
         elif self._active_auto_threads.get((str(channel_id), user_id)):
             logger.info(
@@ -3142,6 +3210,12 @@ class FluxerAdapter(BasePlatformAdapter):
                 anchor = str(data.get("id") or "").strip()
                 if not anchor:
                     return channel_id, chat_type, None, None
+                # Link the goal to the container it just claimed. The link has to
+                # outlive this turn -- a paused goal is resumed from the parent
+                # channel long after the kickoff turn ended.
+                self._remember_goal_thread(
+                    channel_id, _author_id_from_data(data), anchor
+                )
                 if len(self._threads_pending) > self._threads_by_anchor_max:
                     self._threads_pending.pop(next(iter(self._threads_pending)), None)
                 return anchor, "thread", str(channel_id), str(channel_id)
