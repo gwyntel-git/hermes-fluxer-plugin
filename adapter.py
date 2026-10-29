@@ -2835,19 +2835,6 @@ class FluxerAdapter(BasePlatformAdapter):
             return "", ""
         return str(entry[0]), str(entry[1] or "")
 
-    def _cached_auto_thread_name(self, thread_id: str) -> Optional[str]:
-        """The placeholder this adapter gave ``thread_id``, if it still remembers it."""
-        tid = str(thread_id or "")
-        if not tid:
-            return None
-        for _chat, (cached_id, name) in self._auto_thread_by_chat.items():
-            if str(cached_id) == tid:
-                return str(name or "")
-        for _session, (cached_id, name) in self._auto_thread_by_session.items():
-            if str(cached_id) == tid:
-                return str(name or "")
-        return None
-
     async def _fetch_channel_name(self, channel_id: str) -> Optional[str]:
         """Current server-side name of a channel or thread, else ``None``."""
         try:
