@@ -2506,12 +2506,14 @@ class FluxerAdapter(BasePlatformAdapter):
         user_id = _author_id_from_data(data)
         if not user_id:
             return None
-        if _goal_control_ends_goal(content):
-            # The goal is over, so the link to its container goes with it.
-            self._forget_goal_thread(channel_id, user_id)
         target = self._active_auto_thread_for_user(str(channel_id), user_id)
         if not target and goal_control:
             target = self._goal_thread_for(channel_id, user_id)
+        if _goal_control_ends_goal(content):
+            # Resolve BEFORE forgetting: the ending command itself still has to reach
+            # the goal's session, and a paused goal has no live turn to point at it.
+            # Only the commands that follow the ending one fall back to the channel.
+            self._forget_goal_thread(channel_id, user_id)
         if target:
             logger.info(
                 "Fluxer parent-channel /%s routed to the thread it belongs to", name

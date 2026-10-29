@@ -958,3 +958,31 @@ async def test_a_goal_link_is_not_shared_between_users():
     )
 
     assert (chat_id, chat_type) == (PARENT, "channel")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["/goal clear", "/goal stop", "/goal done"])
+async def test_a_paused_goal_can_be_ended_from_the_parent(content):
+    """The ending command itself must reach the goal's session, not the empty channel.
+
+    A paused goal has no live turn, so its container link is the only route -- and
+    the link must be read before it is dropped, or the command clears a session that
+    holds no goal and the goal keeps running.
+    """
+    adapter = _adapter()
+    await adapter._resolve_thread_source(
+        {"id": ANCHOR, "channel_id": PARENT, "content": "/goal confirm the mac watcher",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+    adapter._active_auto_threads.clear()
+
+    chat_id, chat_type, parent, pending = await adapter._resolve_thread_source(
+        {"id": "cmd-end", "channel_id": PARENT, "content": content,
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type, parent, pending) == (ANCHOR, "thread", PARENT, None)
+    # ...and it is dropped afterwards, so later controls go back to the channel.
+    assert adapter._goal_threads == {}
