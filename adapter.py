@@ -705,6 +705,64 @@ def _is_text_command(text: str) -> bool:
     return bool(name) and "/" not in name
 
 
+# Verbs that CONTROL an existing goal instead of starting one; mirrors
+# ``hermes_cli.goal_command.is_goal_control`` (the ``_EXACT_HANDLERS`` keys plus the
+# ``wait``/``gate`` prefixes). The plugin has to import standalone -- the host CLI is
+# not on the standalone test path -- so the grammar is duplicated here and pinned by
+# ``tests/test_fluxer_thread_id_space.py``.
+_GOAL_CONTROL_WORDS = frozenset({
+    "", "status", "show", "pause", "resume", "clear", "stop", "done", "unwait",
+    "wait", "gate",
+})
+# Commands that START a session of their own. ``/goal`` enqueues a kickoff turn and
+# then one continuation turn after another, so its container has to be chosen once,
+# at the command, and then reused by every turn of the series.
+_SESSION_STARTING_COMMANDS = frozenset({"goal"})
+
+
+def _command_name_and_args(text: str) -> tuple[str, str]:
+    """``(name, args)`` of a gateway command typed as text, else ``("", "")``."""
+    stripped = str(text or "").lstrip()
+    if not _is_text_command(stripped):
+        return "", ""
+    head, _sep, rest = stripped.partition(" ")
+    return head[1:].split("@", 1)[0].lower(), rest.strip()
+
+
+def _starts_own_session(text: str) -> bool:
+    """True when ``text`` is a command whose kickoff OWNS its container.
+
+    ``/goal fix the watcher`` starts an autonomous loop: the kickoff turn and every
+    continuation after it belong in ONE container, so the command is keyed on its
+    own anchor message exactly like an ordinary message. Fluxer gives the thread
+    that anchor's id, which is what makes the thread the session's container
+    instead of a place the first burst merely happens to land.
+
+    A goal CONTROL command (``/goal status``, ``/goal pause``, ``/goal gate list``)
+    is deliberately not in this set: it addresses a goal that already exists, so
+    keying it on a fresh anchor would create a session with no goal behind it.
+    """
+    name, args = _command_name_and_args(text)
+    if name not in _SESSION_STARTING_COMMANDS:
+        return False
+    first = args.split(None, 1)[0].lower() if args else ""
+    return first not in _GOAL_CONTROL_WORDS
+
+
+def _addresses_active_goal(text: str) -> bool:
+    """True when ``text`` controls the goal that is already running.
+
+    Those commands act on the session the goal lives in, which after a threaded
+    kickoff is the goal's THREAD, not the channel the operator happens to be typing
+    in -- the same reach problem ``/stop`` has. ``/subgoal`` modifies the running
+    goal too, so it belongs here.
+    """
+    name, _args = _command_name_and_args(text)
+    if name == "subgoal":
+        return True
+    return name in _SESSION_STARTING_COMMANDS and not _starts_own_session(text)
+
+
 def _thread_id_from_session_key(session_key: Optional[str], platform: str) -> Optional[str]:
     """The thread container a session key is bound to, or ``None``.
 
@@ -2355,22 +2413,29 @@ class FluxerAdapter(BasePlatformAdapter):
         return next(iter(threads)) if len(threads) == 1 else None
 
     def _command_targets_active_thread(self, data: Dict[str, Any], channel_id: str) -> Optional[str]:
-        """The active auto-thread a parent-channel ``/stop`` should address, if any.
+        """The active auto-thread a parent-channel command should address, if any.
 
-        A turn this adapter moved into a thread is keyed on the THREAD, so a
-        ``/stop`` typed in the parent channel derives the channel's session key and
-        cancels a session with no run while the real turn keeps going. Fluxer gives
-        the thread the id of the message that opened it, and that message came from
-        the parent channel, so the operator's own next command there is the natural
-        way to stop it -- it just has to address the thread's session.
+        A turn this adapter moved into a thread is keyed on the THREAD, so a command
+        typed in the parent channel derives the channel's session key and addresses a
+        session with no run -- while the real turn keeps going. Fluxer gives the
+        thread the id of the message that opened it, and that message came from the
+        parent channel, so the operator's own next command there is the natural way
+        to reach it; it just has to address the thread's session.
+
+        ``/stop`` is the plain case. The goal-control commands (``/goal status``,
+        ``/goal pause``, ``/subgoal add ...``) have the same reach problem once a
+        ``/goal`` kickoff owns a thread, and a command that starts a NEW goal is
+        deliberately excluded: retargeting it would replace the goal already running
+        instead of starting a second one.
         """
         content = str(data.get("content") or "").lstrip()
         if not content.startswith("/"):
             return None
         name = content.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
-        if name != "stop":
-            # Only /stop addresses a running turn; /new, /title and the rest act on
-            # the session they are typed into and keep their channel semantics.
+        if name != "stop" and not _addresses_active_goal(content):
+            # Only a command that acts on the running turn (or on the goal that turn
+            # is serving) is retargeted; /new, /title and the rest act on the
+            # session they are typed into and keep their channel semantics.
             return None
         author = data.get("author") or data.get("user") or {}
         user_id = str(
@@ -2381,13 +2446,13 @@ class FluxerAdapter(BasePlatformAdapter):
         target = self._active_auto_thread_for_user(str(channel_id), user_id)
         if target:
             logger.info(
-                "Fluxer parent-channel /stop routed to the active thread"
+                "Fluxer parent-channel /%s routed to the active thread", name
             )
         elif self._active_auto_threads.get((str(channel_id), user_id)):
             logger.info(
-                "Fluxer parent-channel /stop left on the channel: "
+                "Fluxer parent-channel /%s left on the channel: "
                 "%d active threads, none unambiguous",
-                len(self._active_auto_threads[(str(channel_id), user_id)]),
+                name, len(self._active_auto_threads[(str(channel_id), user_id)]),
             )
         return target
 
@@ -3063,6 +3128,23 @@ class FluxerAdapter(BasePlatformAdapter):
         # reply -- which both resolve their container from the turn anchor -- do not
         # open a thread on the command's own message either.
         if _is_text_command(str(data.get("content") or "")):
+            # A command that starts a session of its own owns the container it was
+            # typed in, exactly like an ordinary message. Its kickoff turn keeps the
+            # command's message id as the turn anchor and Fluxer gives the thread
+            # that anchor's id, so keying the command on the anchor is what makes the
+            # thread the SESSION's container: the kickoff, every continuation turn,
+            # the typing indicator and the judge's notices all resolve to it.
+            # Keying it on the channel instead split one goal across two id spaces --
+            # the kickoff threaded its own message, then every anchorless
+            # continuation turn fell back to the parent channel, so the agent lost
+            # the thread partway through the goal.
+            if _starts_own_session(str(data.get("content") or "")):
+                anchor = str(data.get("id") or "").strip()
+                if not anchor:
+                    return channel_id, chat_type, None, None
+                if len(self._threads_pending) > self._threads_by_anchor_max:
+                    self._threads_pending.pop(next(iter(self._threads_pending)), None)
+                return anchor, "thread", str(channel_id), str(channel_id)
             # A parent-channel /stop addresses the turn this user has running in a
             # thread -- that turn's session is keyed on the thread, so the channel's
             # own key would cancel nothing. Other commands keep the channel session.

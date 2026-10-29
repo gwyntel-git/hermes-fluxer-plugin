@@ -27,6 +27,7 @@ suite's fixture) rather than a stub that would hide the wrong-container lookup.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import sqlite3
 import tempfile
@@ -684,3 +685,181 @@ async def test_a_human_thread_never_escapes_to_the_parent_channel(monkeypatch):
         ANCHOR, None, {}
     )
     assert auto_thread_id == ANCHOR
+
+
+def _without_message_id(source):
+    """The same source with no trigger message: the gateway's continuation shape.
+
+    ``_synthetic_prompt_event`` does ``dataclasses.replace(source, message_id=None)``
+    on the real ``SessionSource``; the standalone harness builds a namespace, so this
+    mirrors the field change for both.
+    """
+    if dataclasses.is_dataclass(source):
+        return dataclasses.replace(source, message_id=None)
+    return SimpleNamespace(**{**vars(source), "message_id": None})
+
+
+# ── a /goal owns its thread: one goal, one container, start to finish ─────────
+# Live report from #gpu-go-brr: `/goal ...` was typed in a thread-enabled channel,
+# the first burst landed in the child thread the kickoff turn opened, and every
+# later turn of the same goal landed in the parent channel -- so the agent "lost
+# place" partway through its own goal. One goal, two id spaces:
+#
+#   * the kickoff turn kept the command's message id as its anchor, so its send
+#     opened a thread from that message (Fluxer gives the thread the anchor's id);
+#   * the command itself was keyed on the CHANNEL (the rule for a control command
+#     like /stop), so the goal's session was the channel session;
+#   * every continuation turn is a synthetic event whose ``message_id`` is dropped
+#     -- anchorless by design -- so nothing tied it to the thread the burst opened
+#     and it fell back to the parent channel.
+#
+# The fix keys a session-starting command on its own anchor, exactly like an
+# ordinary message: the thread becomes the SESSION's container, so the kickoff,
+# every continuation, the typing indicator and the judge's notices all resolve to
+# it. Control commands (/stop, /goal status, /subgoal) keep the channel and reach
+# the goal's thread through the live-turn index instead.
+
+
+@pytest.mark.asyncio
+async def test_a_goal_kickoff_owns_the_thread_its_continuations_run_in():
+    """`/goal <something to do>` must key the whole goal on the thread it opens."""
+    adapter = _adapter(require_mention=True)
+    adapter.bot_user_id = "bot-9"
+    adapter._session_title_for_chat = lambda *_a, **_k: None
+    adapter._schedule_title_rename = lambda *_a, **_k: None
+    calls: list[tuple[str, str]] = []
+
+    async def fake_request(method, path, **kwargs):
+        calls.append((method, path))
+        return {"id": ANCHOR, "name": "goal thread"}
+
+    adapter._request = fake_request
+    seen = []
+
+    async def fake_handle(event):
+        seen.append(event)
+
+    adapter.handle_message = fake_handle
+    await adapter._handle_message_create(
+        {
+            "id": ANCHOR,
+            "channel_id": PARENT,
+            "channel_type": "channel",
+            "content": "<@bot-9> /goal confirm the mac watcher and cron delivery",
+            "author": {"id": USER, "username": "Rowan", "bot": False},
+        },
+        {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+    )
+
+    assert len(seen) == 1
+    kickoff = seen[0]
+    # The goal's session container IS the thread Fluxer will open from this message.
+    assert kickoff.source.chat_id == ANCHOR
+    assert kickoff.source.chat_type == "thread"
+    # ...and it is a prospective thread, not a command that must never open one.
+    assert adapter._threads_pending.get(ANCHOR) == PARENT
+    assert (PARENT, ANCHOR) not in adapter._no_thread_anchors
+
+    # A continuation turn: the gateway drops ``message_id`` (it is not a reply to
+    # the triggering message), so the turn arrives anchorless. Typing and delivery
+    # must still resolve to the goal's thread rather than the parent channel.
+    continuation = _without_message_id(kickoff.source)
+    assert continuation.chat_id == ANCHOR
+
+    typed_to = await adapter._typing_target(continuation.chat_id)
+    await adapter.send_typing(continuation.chat_id)
+    await _drain_loop()
+    target, _payload, auto_thread_id = await adapter._resolve_outbound_target(
+        continuation.chat_id, None, {}
+    )
+
+    assert typed_to == ANCHOR
+    assert target == ANCHOR
+    assert auto_thread_id == ANCHOR
+    # The indicator refreshes the goal's thread; the parent channel never sees it.
+    assert ("POST", f"/channels/{ANCHOR}/typing") in calls
+    assert ("POST", f"/channels/{PARENT}/typing") not in calls
+    # And the thread it opened is the one anchored on the goal's own message.
+    assert ("POST", f"/channels/{PARENT}/messages/{ANCHOR}/threads") in calls
+    await adapter.stop_typing(ANCHOR)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["/goal", "/goal status", "/goal show", "/goal pause", "/goal clear",
+     "/goal gate list", "/goal wait 30", "/subgoal add also check kaggle"],
+)
+@pytest.mark.asyncio
+async def test_goal_control_commands_do_not_open_a_session_of_their_own(content):
+    """A command that addresses an existing goal must not key a fresh container.
+
+    Threading one would create a session with no goal behind it, so ``status``
+    would report "no active goal" forever while the real goal ran elsewhere.
+    """
+    adapter = _adapter()
+    chat_id, chat_type, _parent, pending = await adapter._resolve_thread_source(
+        {"id": "msg-cmd", "channel_id": PARENT, "content": content,
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type, pending) == (PARENT, "channel", None)
+    assert (PARENT, "msg-cmd") in adapter._no_thread_anchors
+
+
+@pytest.mark.asyncio
+async def test_goal_control_from_the_parent_reaches_the_goals_thread():
+    """`/goal status` typed in the channel must address the goal's own session.
+
+    With the goal keyed on its thread, the parent channel's session holds no goal,
+    so the command has to ride the same live-turn index `/stop` uses.
+    """
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {ANCHOR: 1}
+
+    chat_id, chat_type, parent, pending = await adapter._resolve_thread_source(
+        {"id": "cmd-2", "channel_id": PARENT, "content": "/goal status",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type, parent, pending) == (ANCHOR, "thread", PARENT, None)
+
+
+@pytest.mark.asyncio
+async def test_a_new_goal_from_the_parent_never_hijacks_the_running_one():
+    """A second `/goal <spec>` starts its own goal; it must not retarget the first.
+
+    Same channel, same live turn: only the control form rides the active thread.
+    """
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {ANCHOR: 1}
+
+    chat_id, chat_type, parent, pending = await adapter._resolve_thread_source(
+        {"id": "msg-second-goal", "channel_id": PARENT,
+         "content": "/goal a different job entirely", "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type, parent, pending) == (
+        "msg-second-goal", "thread", PARENT, PARENT
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_goal_control_command_is_not_retargeted_when_the_thread_is_ambiguous():
+    """Two live threads for one user: the command stays put, same rule as /stop."""
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._remember_thread_id({"id": "msg-other-thread"}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {ANCHOR: 1, "msg-other-thread": 1}
+
+    chat_id, chat_type, _parent, _pending = await adapter._resolve_thread_source(
+        {"id": "cmd-3", "channel_id": PARENT, "content": "/goal pause",
+         "author": {"id": USER}},
+        PARENT, "channel",
+    )
+
+    assert (chat_id, chat_type) == (PARENT, "channel")
