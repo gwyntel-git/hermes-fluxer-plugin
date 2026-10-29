@@ -556,3 +556,131 @@ async def test_the_active_thread_index_is_released_when_the_turn_ends():
 
     adapter._unregister_active_auto_thread(*registered)
     assert (PARENT, USER) not in adapter._active_auto_threads
+
+
+@pytest.mark.asyncio
+async def test_mention_stripped_parent_stop_resolves_to_active_thread():
+    adapter = _adapter()
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {ANCHOR: 1}
+    message = _stop_message(content="<@bot-id> /stop")
+    message["content"] = "/stop"  # text returned by mention gate
+    chat_id, chat_type, parent, pending = await adapter._resolve_thread_source(
+        message, PARENT, "channel"
+    )
+    assert (chat_id, chat_type, parent, pending) == (ANCHOR, "thread", PARENT, None)
+
+
+@pytest.mark.asyncio
+async def test_a_mention_prefixed_command_reaches_the_active_thread():
+    """The mention gate's stripped text must reach the container resolver.
+
+    With mentions required, `<@bot> /stop` is stripped to ``/stop`` by the
+    admission gate -- but the resolver used to read the RAW ``data['content']``,
+    so the leading mention made ``_is_text_command`` fail and the command was
+    routed as a brand-new prospective thread instead of the running turn's
+    container. The end-to-end handler is exercised here, not the resolver
+    directly: the fix is in what the handler passes it.
+    """
+    adapter = _adapter(require_mention=True)
+    adapter.bot_user_id = "bot-9"
+    adapter._remember_thread_id({"id": ANCHOR}, PARENT)
+    adapter._active_auto_threads[(PARENT, USER)] = {ANCHOR: 1}
+    seen = []
+
+    async def fake_handle(event):
+        seen.append(event)
+
+    adapter.handle_message = fake_handle
+    await adapter._handle_message_create(
+        {
+            "id": "msg-cmd",
+            "channel_id": PARENT,
+            "channel_type": "channel",
+            "content": "<@bot-9> /stop",
+            "author": {"id": USER, "username": "Rowan", "bot": False},
+        },
+        {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+    )
+
+    assert len(seen) == 1
+    # The command keys on the running turn's thread, not a fresh pending thread.
+    assert seen[0].source.chat_id == ANCHOR
+    assert seen[0].source.chat_type == "thread"
+    assert not adapter._threads_pending
+
+
+def test_pending_auto_thread_is_registered_and_released():
+    adapter = _adapter()
+    adapter._threads_pending[ANCHOR] = PARENT
+    source = SimpleNamespace(chat_id=ANCHOR, parent_chat_id=PARENT, chat_type="thread", user_id=USER)
+    token = adapter._register_active_auto_thread(source)
+    assert token == (PARENT, USER, ANCHOR)
+    adapter._unregister_active_auto_thread(*token)
+    assert adapter._active_auto_threads == {}
+
+
+# ── Greptile 4402981743: typing must honor a failed-creation decision ──────────
+
+
+@pytest.mark.asyncio
+async def test_typing_never_opens_a_thread_after_delivery_gave_up(state_db):
+    """A turn that already chose the parent must keep typing in the parent.
+
+    Delivery marks the turn's thread disabled when the first creation fails.
+    A later typing refresh re-resolves its container from ``_threads_pending``,
+    which still lists the anchor -- so without the guard typing would open the
+    thread the delivery had just abandoned and split the turn across two
+    containers. The indicator must stay on the parent and never create.
+    """
+    adapter = _adapter()
+    adapter._threads_pending[ANCHOR] = PARENT
+    # Delivery already failed to create this turn's thread and disabled it.
+    adapter._disable_turn_thread(PARENT, ANCHOR)
+    calls: list[tuple[str, str]] = []
+
+    async def fake_request(method, path, **kwargs):
+        calls.append((method, path))
+        return {}
+
+    adapter._request = fake_request
+    adapter._schedule_title_rename = lambda *args: None
+
+    await adapter.send_typing(PARENT, metadata={"reply_to_message_id": ANCHOR})
+    await _drain_loop()
+    await adapter.stop_typing(PARENT, metadata={"reply_to_message_id": ANCHOR})
+
+    assert not any(path.endswith("/threads") for _m, path in calls)
+    assert ("POST", f"/channels/{PARENT}/typing") in calls
+    assert ("POST", f"/channels/{ANCHOR}/typing") not in calls
+
+
+# ── Greptile 4402981754: only this adapter's threads earn the parent fallback ──
+
+
+@pytest.mark.asyncio
+async def test_a_human_thread_never_escapes_to_the_parent_channel(monkeypatch):
+    """A dead human-created thread must fail in place, not repost to the parent.
+
+    ``_resolve_outbound_target`` used to mark ANY thread (including one a human
+    opened) as an auto-chosen container, so a missing-container error moved the
+    reply to the parent channel -- where the human thread's audience never sees
+    it. Knowing a thread's parent is not this adapter choosing it: the parent
+    fallback is only for threads this adapter opened.
+    """
+    adapter = _adapter()
+    adapter._thread_parents[ANCHOR] = PARENT
+    adapter._remember_thread_owner(ANCHOR, False)  # a human created it
+
+    _target, _payload, auto_thread_id = await adapter._resolve_outbound_target(
+        ANCHOR, None, {}
+    )
+    assert _target == ANCHOR
+    assert auto_thread_id is None
+
+    # And the bot-owned case still earns the fallback (non-regression guard).
+    adapter._remember_thread_owner(ANCHOR, True)
+    _target, _payload, auto_thread_id = await adapter._resolve_outbound_target(
+        ANCHOR, None, {}
+    )
+    assert auto_thread_id == ANCHOR

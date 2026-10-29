@@ -2322,7 +2322,9 @@ class FluxerAdapter(BasePlatformAdapter):
             return None
         if str(getattr(source, "chat_type", None) or "") != "thread":
             return None
-        if self._thread_is_bot_owned(thread_id) is not True:
+        # A first-turn source is admitted before its thread exists; the pending
+        # parent is the adapter's proof that it chose this prospective container.
+        if self._thread_is_bot_owned(thread_id) is not True and not self._threads_pending.get(thread_id):
             return None
         threads = self._active_auto_threads.setdefault((parent, user_id), {})
         threads[thread_id] = threads.get(thread_id, 0) + 1
@@ -2379,14 +2381,12 @@ class FluxerAdapter(BasePlatformAdapter):
         target = self._active_auto_thread_for_user(str(channel_id), user_id)
         if target:
             logger.info(
-                "Fluxer parent-channel /stop from %s in %s routed to the active thread %s",
-                user_id, channel_id, target,
+                "Fluxer parent-channel /stop routed to the active thread"
             )
         elif self._active_auto_threads.get((str(channel_id), user_id)):
             logger.info(
-                "Fluxer parent-channel /stop from %s in %s left on the channel: "
+                "Fluxer parent-channel /stop left on the channel: "
                 "%d active threads, none unambiguous",
-                user_id, channel_id,
                 len(self._active_auto_threads[(str(channel_id), user_id)]),
             )
         return target
@@ -2938,7 +2938,7 @@ class FluxerAdapter(BasePlatformAdapter):
         except Exception as exc:
             # A lookup failure must not invent a parent, and must not cost the
             # message: leave the thread exactly as it arrived and try again later.
-            logger.debug("Fluxer thread info lookup failed for %s (%s)", tid, type(exc).__name__)
+            logger.debug("Fluxer thread info lookup failed (%s)", type(exc).__name__)
             return {}
         if not isinstance(info, Mapping):
             return {}
@@ -3149,6 +3149,9 @@ class FluxerAdapter(BasePlatformAdapter):
         target, needs_creation = self._typing_target_sync(chat_id, metadata)
         if not needs_creation:
             return target or str(chat_id)
+        turn_key = self._turn_key(chat_id, metadata=metadata)
+        if turn_key in self._turn_thread_disabled:
+            return str(self._threads_pending.get(target) or self._threads_pending.get(str(chat_id)) or chat_id)
         parent = (
             self._threads_pending.get(target)
             or self._threads_pending.get(str(chat_id))
@@ -3234,7 +3237,13 @@ class FluxerAdapter(BasePlatformAdapter):
             # deleted before the reply, and only an ``auto_thread_id`` gets the
             # parent-channel fallback instead of a failed send.
             target_chat_id = str(chat_id)
-            auto_thread_id = str(chat_id)
+            # Only a thread THIS adapter opened is an automatic destination. A
+            # human-created thread keeps the delivery target but never earns the
+            # parent fallback: knowing a thread's parent is not the same as this
+            # adapter choosing it, and a dead human thread must fail in place
+            # rather than escape into the parent channel.
+            if self._thread_is_bot_owned(str(chat_id)) is True:
+                auto_thread_id = str(chat_id)
         else:
             turn_key = self._turn_key(chat_id, reply_to, metadata)
             anchor = turn_key[1]
@@ -4723,7 +4732,7 @@ class FluxerAdapter(BasePlatformAdapter):
         # is keyed on the anchor that names it. Registered only now that the message
         # is admitted, so a rejected message never leaves a pending thread behind.
         source_chat_id, source_chat_type, parent_chat_id, pending_parent = await self._resolve_thread_source(
-            data, channel_id, chat_type
+            {**data, "content": text}, channel_id, chat_type
         )
         if pending_parent:
             self._threads_pending[source_chat_id] = pending_parent
