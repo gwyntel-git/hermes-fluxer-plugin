@@ -160,6 +160,91 @@ async def test_a_thread_still_carrying_the_placeholder_is_renamed_to_the_title()
 
 
 @pytest.mark.asyncio
+async def test_slash_title_cannot_overwrite_a_human_thread_name():
+    """/title runs after adoption and used the cached label as its guard -- which on
+    the adoption path is the server's own name, so the guard passed by construction
+    and a human's name was replaced."""
+    adapter = _adapter()
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: None
+    adapter.create_thread = AsyncMock(side_effect=_FakeHttpError(400, THREAD_EXISTS_BODY))
+    adapter._fetch_channel_name = AsyncMock(return_value="Gwyn's own thread name")
+    adapter._schedule_title_rename = lambda *args: None
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+    # The session is the thread this turn owns, so /title resolves to them.
+    adapter._session_origin_for_key = lambda _key: ("chan-1", None)
+    adapter._auto_thread_for_session = lambda *_a: ("msg-1", "Gwyn's own thread name")
+    adapter._request = AsyncMock(return_value={})
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:thread:msg-1:u1", "Deploying")
+
+    adapter._request.assert_not_awaited()  # no PATCH: the human's name stands
+
+
+@pytest.mark.asyncio
+async def test_slash_title_still_renames_a_thread_this_adapter_named():
+    """The other direction: an untouched thread keeps taking /title."""
+    adapter = _adapter()
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: None
+    adapter.create_thread = AsyncMock(return_value={"id": "msg-1", "name": "deploy the thing"})
+    adapter._fetch_channel_name = AsyncMock(return_value="deploy the thing")
+    adapter._schedule_title_rename = lambda *args: None
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+    adapter._session_origin_for_key = lambda _key: ("chan-1", None)
+    adapter._auto_thread_for_session = lambda *_a: ("msg-1", "deploy the thing")
+    calls: list = []
+
+    async def fake_request(method, path, **kwargs):
+        calls.append(method)
+        return {}
+
+    adapter._request = fake_request
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:thread:msg-1:u1", "Deploying")
+
+    assert calls == ["PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_thread_with_a_stale_placeholder_is_renamed():
+    """A restart can land after the placeholder was written but before the rename, so
+    the session title already exists when adoption runs. The failed create applies
+    nothing, and later sends only reuse the cached thread without re-checking -- so
+    adoption has to run the guarded rename even when a title is available."""
+    adapter = _adapter()
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: "Deploying the thing"
+    adapter.create_thread = AsyncMock(side_effect=_FakeHttpError(400, THREAD_EXISTS_BODY))
+    # The thread still carries the pre-restart placeholder, so the guard passes.
+    adapter._fetch_channel_name = AsyncMock(return_value="deploy the thing")
+    watched: list = []
+    adapter._schedule_title_rename = lambda *args: watched.append(args)
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+
+    assert watched == [("chan-1", "msg-1", "deploy the thing", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_created_thread_does_not_schedule_a_second_rename():
+    """Only adoption needs the rename when a title already exists: a thread created
+    here was born with the title, so scheduling again would be redundant work."""
+    adapter = _adapter()
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: "Deploying the thing"
+    adapter.create_thread = AsyncMock(return_value={"id": "msg-1", "name": "Deploying the thing"})
+    watched: list = []
+    adapter._schedule_title_rename = lambda *args: watched.append(args)
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+
+    assert watched == []
+
+
+@pytest.mark.asyncio
 async def test_an_unreadable_server_name_still_adopts_the_thread():
     adapter = _adapter()
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"

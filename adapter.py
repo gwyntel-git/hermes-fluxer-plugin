@@ -1375,6 +1375,12 @@ class FluxerAdapter(BasePlatformAdapter):
         # opened last, so /title needs this to rename the session's own thread
         # rather than whoever happened to post most recently.
         self._auto_thread_by_session: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
+        # ``thread_id`` -> the name THIS adapter last wrote to that thread. A rename
+        # guard is an authorisation, not a label: it says "the current name is still
+        # one I chose, so I may replace it". An adopted thread's server name may be a
+        # human's, so it must never be stored here -- it lives in the label maps
+        # above for display only.
+        self._auto_thread_guards: OrderedDict[str, str] = OrderedDict()
         # Live lookups for a thread that is still waiting for its session title.
         self._title_tasks: Dict[str, asyncio.Task] = {}
         # Hermes' session store, opened lazily and read-only (see
@@ -2130,6 +2136,7 @@ class FluxerAdapter(BasePlatformAdapter):
             self._auto_thread_by_chat.pop(chat_key, None)
         for session_key in [k for k, v in self._auto_thread_by_session.items() if v[0] == tid]:
             self._auto_thread_by_session.pop(session_key, None)
+        self._auto_thread_guards.pop(tid, None)
 
     def _pinned_turn_anchor(self, chat_id: str) -> str:
         """Anchor message pinned when the current turn started, else ``""``."""
@@ -2268,17 +2275,30 @@ class FluxerAdapter(BasePlatformAdapter):
                     self._threads_by_anchor.popitem(last=False)
                 created_name = str((data or {}).get("name") or thread_name)
                 self._record_auto_thread(chat_id, thread_id, created_name, author_id)
+                # A guard authorises replacing the server's current name, so it must
+                # be the name this adapter would have written BEFORE any title
+                # rename. For a created thread that is the name just written; for an
+                # adopted one it is the placeholder derived from the anchor message,
+                # which is stable across restarts. ``thread_name`` is wrong here: it
+                # already holds the title when one exists, and comparing a title
+                # against a thread that still carries its placeholder always declines.
+                self._remember_thread_guard(
+                    thread_id, placeholder if adopted else created_name
+                )
                 if created_name != placeholder:
                     self._note_renamed_thread(thread_id, created_name)
-                if not title:
-                    # Guard with the name this adapter would have given the thread,
-                    # never with the one an adopted thread already carries: there
-                    # ``created_name`` is the server's current name, which a human
-                    # may have chosen, and the guard is exactly what authorises the
-                    # overwrite -- so passing it would let the session title clobber
-                    # that human's choice.
+                # An adopted thread may have kept a stale placeholder from before a
+                # restart, so run the guarded rename even when a title already
+                # exists -- the guard is what keeps a human's name safe, and a
+                # later send only reuses the cached thread without re-checking.
+                if not title or adopted:
+                    # Guard with the placeholder, never with the name an adopted
+                    # thread already carries: there ``created_name`` is the server's
+                    # current name, which a human may have chosen, and the guard is
+                    # exactly what authorises the overwrite -- so passing it would
+                    # let the session title clobber that human's choice.
                     self._schedule_title_rename(
-                        chat_id, thread_id, thread_name if adopted else created_name, author_id
+                        chat_id, thread_id, placeholder if adopted else created_name, author_id
                     )
             return thread_id
 
@@ -2335,6 +2355,27 @@ class FluxerAdapter(BasePlatformAdapter):
             self._thread_create_locks.pop(key, None)
 
     # ── session-title naming for a thread this adapter opened ───────────────────
+
+    def _remember_thread_guard(self, thread_id: str, name: str) -> None:
+        """Record the name this adapter wrote to a thread, as a rename guard.
+
+        Kept apart from the label maps on purpose: a label is what the thread is
+        called, while a guard is the authorisation to replace it. An adopted
+        thread's current name may be a human's, so only names this adapter itself
+        applied belong here.
+        """
+        tid = str(thread_id)
+        if not tid:
+            return
+        self._auto_thread_guards[tid] = str(name or "")
+        self._auto_thread_guards.move_to_end(tid)
+        while len(self._auto_thread_guards) > 1000:
+            self._auto_thread_guards.popitem(last=False)
+
+    def _thread_rename_guard(self, thread_id: str) -> Optional[str]:
+        """The name this adapter last wrote to ``thread_id``, or ``None``."""
+        guard = self._auto_thread_guards.get(str(thread_id))
+        return guard or None
 
     def _record_auto_thread(
         self, chat_id: str, thread_id: str, name: str, user_id: Optional[str] = None
@@ -2590,8 +2631,12 @@ class FluxerAdapter(BasePlatformAdapter):
         if not entry:
             return
         thread_id, initial_name = entry
+        # Guard with the name this adapter actually wrote, not the display label: an
+        # adopted thread's label is the server's own name, which may be a human's
+        # choice, and using it as the guard would authorise /title to replace it.
+        guard = self._thread_rename_guard(thread_id) or (initial_name or None)
         try:
-            applied = await self.rename_thread(thread_id, title, only_if_current_name=initial_name or None)
+            applied = await self.rename_thread(thread_id, title, only_if_current_name=guard)
         except Exception as exc:
             logger.debug("Fluxer /title rename failed for %s: %s", thread_id, exc)
             return
@@ -2747,6 +2792,7 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.debug("Fluxer thread rename failed for %s: %s", tid, exc)
             return False
         self._note_renamed_thread(tid, cleaned)
+        self._remember_thread_guard(tid, cleaned)
         return True
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
