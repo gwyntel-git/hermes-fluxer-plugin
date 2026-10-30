@@ -2260,8 +2260,11 @@ class FluxerAdapter(BasePlatformAdapter):
                 # message and gives it that message's id. Adopt it -- falling back
                 # to the channel here is what drops replies out of their thread.
                 adopted = True
+                # Public repo: AGENTS.md forbids private IDs in logs, so the
+                # adoption is recorded without the anchor or thread id.
                 logger.info(
-                    "Fluxer thread %s already exists for anchor %s; adopting it", message_id, message_id
+                    "Fluxer anchor already has a thread; adopting it instead of "
+                    "falling back to the parent channel"
                 )
                 data = {"id": str(message_id)}
                 server_name = await self._fetch_channel_name(str(message_id))
