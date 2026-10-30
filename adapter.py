@@ -2392,6 +2392,10 @@ class FluxerAdapter(BasePlatformAdapter):
         self._auto_thread_by_session.move_to_end(session_key)
         while len(self._auto_thread_by_session) > 1000:
             self._auto_thread_by_session.popitem(last=False)
+        # A thread recorded here was named by this adapter, so that name is also its
+        # rename guard. The adoption path overrides it afterwards: there the label is
+        # the server's existing name, which may be a human's.
+        self._remember_thread_guard(tid, label)
 
     def auto_thread_info_for_chat(self, chat_id: str) -> Optional[tuple[str, str]]:
         """``(thread_id, name)`` of the thread this adapter opened for ``chat_id``, if any."""
@@ -2630,11 +2634,14 @@ class FluxerAdapter(BasePlatformAdapter):
         entry = self._auto_thread_for_session(origin[0], origin[1])
         if not entry:
             return
-        thread_id, initial_name = entry
-        # Guard with the name this adapter actually wrote, not the display label: an
-        # adopted thread's label is the server's own name, which may be a human's
-        # choice, and using it as the guard would authorise /title to replace it.
-        guard = self._thread_rename_guard(thread_id) or (initial_name or None)
+        thread_id, _initial_name = entry
+        # Guard with the name this adapter actually wrote, never with the display
+        # label: an adopted thread's label is the server's own name, which may be a
+        # human's choice. If the guard is no longer remembered (the map is bounded and
+        # evicts independently of the label maps) there is nothing safe to compare
+        # against, so the rename goes out unguarded -- an explicit /title must land,
+        # and guessing from the label is exactly the bug this guard exists to stop.
+        guard = self._thread_rename_guard(thread_id)
         try:
             applied = await self.rename_thread(thread_id, title, only_if_current_name=guard)
         except Exception as exc:

@@ -160,6 +160,36 @@ async def test_a_thread_still_carrying_the_placeholder_is_renamed_to_the_title()
 
 
 @pytest.mark.asyncio
+async def test_slash_title_is_unguarded_rather_than_label_guarded_after_guard_eviction():
+    """The guard map is bounded independently of the label maps, so a live label can
+    outlive its guard. Falling back to the label would reinstate exactly the bug: an
+    adopted thread's label is the server's own name. With no guard remembered the
+    rename goes out unguarded, because an explicit /title must still land."""
+    adapter = _adapter()
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: None
+    adapter.create_thread = AsyncMock(side_effect=_FakeHttpError(400, THREAD_EXISTS_BODY))
+    adapter._fetch_channel_name = AsyncMock(return_value="Gwyn's own thread name")
+    adapter._schedule_title_rename = lambda *args: None
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+    # Evict the guard, keep the label -- exactly what an independent bound allows.
+    adapter._auto_thread_guards.clear()
+    assert adapter.auto_thread_info_for_chat("chan-1") == ("msg-1", "Gwyn's own thread name")
+    adapter._session_origin_for_key = lambda _key: ("chan-1", None)
+    adapter._auto_thread_for_session = lambda *_a: ("msg-1", "Gwyn's own thread name")
+    adapter.rename_thread = AsyncMock(return_value=True)
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:thread:msg-1:u1", "Deploying")
+
+    # Not label-guarded: the server's own name is not the guard. Unguarded is the
+    # only safe answer once the written name is forgotten, so /title still lands.
+    adapter.rename_thread.assert_awaited_once_with(
+        "msg-1", "Deploying", only_if_current_name=None
+    )
+
+
+@pytest.mark.asyncio
 async def test_slash_title_cannot_overwrite_a_human_thread_name():
     """/title runs after adoption and used the cached label as its guard -- which on
     the adoption path is the server's own name, so the guard passed by construction
