@@ -240,6 +240,40 @@ async def test_the_creation_locks_stay_bounded():
 
 
 @pytest.mark.asyncio
+async def test_the_lock_map_returns_to_its_bound_as_sends_finish():
+    """While every candidate is busy the map overshoots its bound. Releasing the last
+    mark must trim it back, without waiting for some later anchor to arrive."""
+    adapter = _adapter()
+    adapter._threads_by_anchor_max = 2
+    keys = [("chan-1", f"msg-{index}") for index in range(5)]
+    release = asyncio.Event()
+    all_inside = [asyncio.Event() for _ in keys]
+
+    async def hold(key, inside):
+        async with adapter._thread_creation_slot(key):
+            inside.set()
+            await release.wait()
+
+    tasks = [
+        asyncio.create_task(hold(key, inside))
+        for key, inside in zip(keys, all_inside)
+    ]
+    for inside in all_inside:  # a slot that never opens must fail, not hang
+        await asyncio.wait_for(inside.wait(), timeout=2)
+
+    # Every anchor held a slot at once, so nothing was evictable and the map
+    # legitimately overshot its bound.
+    assert len(adapter._thread_create_locks) == 5
+    assert len(adapter._thread_create_locks) > adapter._threads_by_anchor_max
+
+    release.set()
+    await asyncio.gather(*tasks)
+
+    assert adapter._thread_create_lock_users == {}
+    assert len(adapter._thread_create_locks) <= adapter._threads_by_anchor_max
+
+
+@pytest.mark.asyncio
 async def test_a_lock_a_send_is_holding_is_never_evicted():
     """Eviction on age alone can drop the lock a send still holds, and the next send
     for that anchor then builds a second lock and POSTs a second thread -- the

@@ -2302,6 +2302,11 @@ class FluxerAdapter(BasePlatformAdapter):
                 users[key] = remaining
             else:
                 users.pop(key, None)
+                # The map may have overshot its bound while every candidate was
+                # busy (eviction skips marked anchors), so trim it here as marks
+                # are released. Without this the extra idle locks live until some
+                # later new anchor happens to arrive.
+                self._evict_idle_thread_create_locks()
 
     def _thread_create_lock(self, key: tuple[str, str]) -> asyncio.Lock:
         """A stable per-anchor creation lock, bounded like the anchor map."""
